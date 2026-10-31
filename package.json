@@ -1,6 +1,6 @@
 {
   "name": "block-launcher",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "BlockLauncher — современный Minecraft лаунчер с Mod Intelligence",
   "main": "electron/main.js",
   "scripts": {
@@ -13,7 +13,7 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },
-  "keywords": ["minecraft", "launcher", "modrinth", "mods", "modpack", "tlauncher", "create", "dependencies", "electron"],
+  "keywords": ["minecraft", "launcher", "modrinth", "mods", "fabric", "forge", "neoforge", "electron"],
   "author": "BlockLauncher Team",
   "license": "MIT",
   "dependencies": {
