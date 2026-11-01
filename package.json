@@ -1,13 +1,12 @@
 {
   "name": "block-launcher",
-  "version": "0.3.2",
-  "description": "BlockLauncher — Minecraft launcher with Mod Intelligence",
+  "version": "1.0.0",
+  "description": "Simple working Minecraft launcher",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "dev:web": "vite",
     "build": "vite build",
-    "electron": "electron .",
     "start": "npm run build && electron ."
   },
   "license": "MIT",
@@ -24,6 +23,5 @@
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
     "wait-on": "^8.0.1"
-  },
-  "engines": { "node": ">=18" }
+  }
 }
