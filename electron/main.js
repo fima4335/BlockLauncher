@@ -18,7 +18,7 @@ const ACCOUNTS = path.join(ROOT, 'accounts.json');
 for (const d of Object.values(DIR)) fs.mkdirSync(d, { recursive: true });
 
 let win = null;
-const send = (ch, data) => win && win.webContents.send(ch, data);
+const send = (ch, data) => win && !win.isDestroyed() && win.webContents.send(ch, data);
 
 function readJson(file, fallback) {
   try {
@@ -34,7 +34,7 @@ function download(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.1' } }, (res) => {
+    const req = lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.2' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close();
         fs.unlink(dest, () => {});
@@ -63,7 +63,7 @@ function download(url, dest, onProgress) {
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.1' } }, (res) => {
+    lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.2' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchJson(res.headers.location).then(resolve).catch(reject);
       }
@@ -94,7 +94,6 @@ async function installFabric(gameVersion) {
   fs.mkdirSync(vDir, { recursive: true });
   writeJson(path.join(vDir, versionId + '.json'), profile);
 
-  // libraries from fabric profile
   for (const lib of profile.libraries || []) {
     let url = null;
     let rel = null;
@@ -124,20 +123,31 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1180,
     height: 740,
+    minWidth: 900,
+    minHeight: 600,
     backgroundColor: '#0b1220',
     title: 'BlockLauncher',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
-  if (!app.isPackaged) win.loadURL('http://localhost:5173');
-  else win.loadFile(path.join(__dirname, '../dist/index.html'));
+
+  // packaged → dist/index.html ; dev → vite
+  if (app.isPackaged) {
+    win.loadFile(path.join(__dirname, '../dist/index.html'));
+  } else {
+    win.loadURL('http://localhost:5173');
+  }
 }
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});
 
 ipcMain.handle('accounts:list', () => readJson(ACCOUNTS, []));
 ipcMain.handle('accounts:add', (_e, name) => {
@@ -158,6 +168,7 @@ ipcMain.handle('accounts:remove', (_e, id) => {
 
 ipcMain.handle('instances:list', () => {
   const out = [];
+  if (!fs.existsSync(DIR.instances)) return out;
   for (const name of fs.readdirSync(DIR.instances)) {
     const meta = path.join(DIR.instances, name, 'instance.json');
     if (fs.existsSync(meta)) {
@@ -180,7 +191,6 @@ ipcMain.handle('instances:create', async (_e, { name, version, loader }) => {
 
   if (selectedLoader === 'fabric') {
     try {
-      // ensure vanilla json exists first for inheritsFrom
       const manifest = readJson(path.join(DIR.versions, 'manifest.json'), null);
       if (manifest) {
         const info = manifest.versions.find((v) => v.id === version);
@@ -202,8 +212,7 @@ ipcMain.handle('instances:create', async (_e, { name, version, loader }) => {
       loaderVersion = fab.loaderVersion;
     } catch (e) {
       console.error(e);
-      send('progress', 'Fabric не установлен: ' + e.message);
-      // keep vanilla version id
+      send('progress', 'Fabric: ' + e.message);
     }
   }
 
@@ -239,8 +248,6 @@ ipcMain.handle('versions:list', async () => {
 ipcMain.handle('versions:download', async (_e, versionId) => {
   send('progress', 'Подготовка ' + versionId);
   const manifest = readJson(path.join(DIR.versions, 'manifest.json'), null);
-
-  // fabric profile may already exist
   const existing = path.join(DIR.versions, versionId, versionId + '.json');
   let vJson = readJson(existing, null);
 
@@ -248,17 +255,14 @@ ipcMain.handle('versions:download', async (_e, versionId) => {
     if (!manifest) throw new Error('Нет манифеста версий');
     const info = manifest.versions.find((v) => v.id === versionId);
     if (!info) throw new Error('Версия не найдена: ' + versionId);
-    const vDir = path.join(DIR.versions, versionId);
-    fs.mkdirSync(vDir, { recursive: true });
+    fs.mkdirSync(path.join(DIR.versions, versionId), { recursive: true });
     await download(info.url, existing);
     vJson = readJson(existing, null);
   }
-
   if (!vJson) throw new Error('Не удалось загрузить профиль версии');
 
-  // inheritsFrom (fabric)
-  let baseId = vJson.inheritsFrom || null;
-  if (baseId) {
+  if (vJson.inheritsFrom) {
+    const baseId = vJson.inheritsFrom;
     const baseDir = path.join(DIR.versions, baseId);
     const baseJsonPath = path.join(baseDir, baseId + '.json');
     if (!fs.existsSync(baseJsonPath) && manifest) {
@@ -316,8 +320,7 @@ ipcMain.handle('versions:download', async (_e, versionId) => {
     }
   }
 
-  const nativesDir = path.join(DIR.versions, versionId, 'natives');
-  fs.mkdirSync(nativesDir, { recursive: true });
+  fs.mkdirSync(path.join(DIR.versions, versionId, 'natives'), { recursive: true });
 
   if (vJson.assetIndex && vJson.assetIndex.url) {
     const idxDir = path.join(DIR.assets, 'indexes');
@@ -341,7 +344,6 @@ ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
   const vJson = readJson(path.join(vDir, versionId + '.json'), null);
   if (!vJson) throw new Error('Профиль версии не найден');
 
-  // merge libraries with inheritsFrom
   let libraries = [...(vJson.libraries || [])];
   let mainClass = vJson.mainClass || 'net.minecraft.client.main.Main';
   let assetIndex = vJson.assetIndex;
@@ -354,7 +356,6 @@ ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
       libraries = [...(baseJson.libraries || []), ...libraries];
       if (!assetIndex) assetIndex = baseJson.assetIndex;
       jarPath = path.join(DIR.versions, baseId, baseId + '.jar');
-      if (!vJson.mainClass && baseJson.mainClass) mainClass = baseJson.mainClass;
     }
   }
 
@@ -449,4 +450,4 @@ ipcMain.handle('mods:install', async (_e, { instanceName, slug }) => {
   return installed;
 });
 
-console.log('BlockLauncher:', ROOT);
+console.log('BlockLauncher data:', ROOT);

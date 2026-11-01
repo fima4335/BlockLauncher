@@ -1,15 +1,18 @@
 {
   "name": "block-launcher",
-  "version": "1.0.0",
-  "description": "Simple working Minecraft launcher",
+  "version": "1.2.0",
+  "description": "Автономный Minecraft лаунчер",
   "main": "electron/main.js",
+  "author": "BlockLauncher",
+  "license": "MIT",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "dev:web": "vite",
     "build": "vite build",
-    "start": "npm run build && electron ."
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win portable nsis",
+    "dist:linux": "npm run build && electron-builder --linux AppImage"
   },
-  "license": "MIT",
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -20,8 +23,55 @@
     "@vitejs/plugin-react": "^4.3.1",
     "concurrently": "^9.0.1",
     "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
     "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.blocklauncher.app",
+    "productName": "BlockLauncher",
+    "copyright": "Copyright © BlockLauncher",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.js"
+    },
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        },
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "BlockLauncher-${version}-win-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BlockLauncher"
+    },
+    "portable": {
+      "artifactName": "BlockLauncher-Portable.exe"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Game",
+      "artifactName": "BlockLauncher-${version}-linux.${ext}"
+    }
   }
 }
