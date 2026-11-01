@@ -1,46 +1,29 @@
 {
   "name": "block-launcher",
-  "version": "0.3.1",
-  "description": "BlockLauncher — современный Minecraft лаунчер с Mod Intelligence",
+  "version": "0.3.2",
+  "description": "BlockLauncher — Minecraft launcher with Mod Intelligence",
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "dev:web": "vite",
     "build": "vite build",
     "electron": "electron .",
-    "start": "npm run build && electron .",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "start": "npm run build && electron ."
   },
-  "keywords": ["minecraft", "launcher", "modrinth", "fabric", "forge", "electron"],
-  "author": "BlockLauncher Team",
   "license": "MIT",
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@types/node": "^22.7.4",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "concurrently": "^9.0.1",
     "electron": "^33.0.0",
-    "electron-builder": "^25.1.8",
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
     "wait-on": "^8.0.1"
   },
-  "engines": {
-    "node": ">=18"
-  },
-  "build": {
-    "appId": "com.blocklauncher.app",
-    "productName": "BlockLauncher",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*", "electron/**/*", "package.json"],
-    "win": { "target": "nsis" },
-    "linux": { "target": "AppImage" },
-    "mac": { "target": "dmg" }
-  }
+  "engines": { "node": ">=18" }
 }
