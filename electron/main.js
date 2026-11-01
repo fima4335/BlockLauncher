@@ -5,6 +5,16 @@ const https = require('https');
 const http = require('http');
 const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
+const { createWriteStream } = require('fs');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const pipe = promisify(pipeline);
+
+// optional unzip for natives
+let extractZip = null;
+try {
+  // electron may not have adm-zip; use simple approach without extra deps
+} catch {}
 
 const ROOT = app.getPath('userData');
 const DIR = {
@@ -16,6 +26,8 @@ const DIR = {
 const ACCOUNTS = path.join(ROOT, 'accounts.json');
 
 for (const d of Object.values(DIR)) fs.mkdirSync(d, { recursive: true });
+fs.mkdirSync(path.join(DIR.assets, 'objects'), { recursive: true });
+fs.mkdirSync(path.join(DIR.assets, 'indexes'), { recursive: true });
 
 let win = null;
 const send = (ch, data) => win && !win.isDestroyed() && win.webContents.send(ch, data);
@@ -32,9 +44,10 @@ function writeJson(file, data) {
 
 function download(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const file = createWriteStream(dest);
     const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.2' } }, (res) => {
+    const req = lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.3' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close();
         fs.unlink(dest, () => {});
@@ -42,7 +55,7 @@ function download(url, dest, onProgress) {
       }
       if (res.statusCode !== 200) {
         file.close();
-        return reject(new Error('HTTP ' + res.statusCode));
+        return reject(new Error('HTTP ' + res.statusCode + ' ' + url));
       }
       const total = parseInt(res.headers['content-length'] || '0', 10);
       let done = 0;
@@ -63,7 +76,7 @@ function download(url, dest, onProgress) {
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.2' } }, (res) => {
+    lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.3' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchJson(res.headers.location).then(resolve).catch(reject);
       }
@@ -76,15 +89,122 @@ function fetchJson(url) {
   });
 }
 
+/** Скачать все assets из index — нужны для настроек, языков, звуков, UI */
+async function downloadAssets(assetIndex) {
+  if (!assetIndex || !assetIndex.id) return;
+  const idxPath = path.join(DIR.assets, 'indexes', assetIndex.id + '.json');
+  if (!fs.existsSync(idxPath) && assetIndex.url) {
+    send('progress', 'Индекс ресурсов...');
+    await download(assetIndex.url, idxPath);
+  }
+  const index = readJson(idxPath, null);
+  if (!index || !index.objects) return;
+
+  const entries = Object.entries(index.objects);
+  let i = 0;
+  const total = entries.length;
+  // Качаем пакетами, чтобы не убить сеть
+  for (const [name, obj] of entries) {
+    i++;
+    const hash = obj.hash;
+    const sub = hash.substring(0, 2);
+    const dest = path.join(DIR.assets, 'objects', sub, hash);
+    if (fs.existsSync(dest)) continue;
+    const url = 'https://resources.download.minecraft.net/' + sub + '/' + hash;
+    try {
+      await download(url, dest);
+    } catch (e) {
+      console.warn('asset fail', name, e.message);
+    }
+    if (i % 50 === 0) {
+      send('progress', 'Ресурсы ' + i + '/' + total);
+    }
+  }
+  send('progress', 'Ресурсы готовы');
+}
+
+function ruleAllows(lib) {
+  // упрощённо: если есть rules — проверяем OS
+  if (!lib.rules || !lib.rules.length) return true;
+  let allowed = false;
+  for (const rule of lib.rules) {
+    const osOk = !rule.os || rule.os.name === (process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'osx' : 'linux');
+    if (rule.action === 'allow' && osOk) allowed = true;
+    if (rule.action === 'disallow' && osOk) allowed = false;
+  }
+  return allowed;
+}
+
+async function ensureLibraries(libraries) {
+  for (const lib of libraries || []) {
+    if (!ruleAllows(lib)) continue;
+    if (lib.downloads && lib.downloads.artifact) {
+      const art = lib.downloads.artifact;
+      const lp = path.join(DIR.libraries, art.path);
+      if (!fs.existsSync(lp)) {
+        fs.mkdirSync(path.dirname(lp), { recursive: true });
+        try { await download(art.url, lp); } catch (e) { console.warn(e.message); }
+      }
+    } else if (lib.name && lib.url) {
+      const parts = lib.name.split(':');
+      if (parts.length >= 3) {
+        const [group, artifact, ver] = parts;
+        const gpath = group.replace(/\./g, '/');
+        const rel = path.join(gpath, artifact, ver, artifact + '-' + ver + '.jar');
+        const lp = path.join(DIR.libraries, rel);
+        if (!fs.existsSync(lp)) {
+          const url = lib.url.replace(/\/$/, '') + '/' + gpath + '/' + artifact + '/' + ver + '/' + artifact + '-' + ver + '.jar';
+          fs.mkdirSync(path.dirname(lp), { recursive: true });
+          try { await download(url, lp); } catch (e) { console.warn(e.message); }
+        }
+      }
+    }
+    // natives classifier
+    if (lib.downloads && lib.downloads.classifiers) {
+      const key = process.platform === 'win32' ? 'natives-windows'
+        : process.platform === 'darwin' ? 'natives-macos' : 'natives-linux';
+      const nat = lib.downloads.classifiers[key] || lib.downloads.classifiers['natives-windows'];
+      if (nat && nat.path && nat.url) {
+        const lp = path.join(DIR.libraries, nat.path);
+        if (!fs.existsSync(lp)) {
+          fs.mkdirSync(path.dirname(lp), { recursive: true });
+          try { await download(nat.url, lp); } catch {}
+        }
+      }
+    }
+  }
+}
+
+function collectClasspath(libraries, jarPath) {
+  const cp = [jarPath];
+  for (const lib of libraries || []) {
+    if (!ruleAllows(lib)) continue;
+    if (lib.downloads && lib.downloads.artifact) {
+      const lp = path.join(DIR.libraries, lib.downloads.artifact.path);
+      if (fs.existsSync(lp)) cp.push(lp);
+    } else if (lib.name) {
+      const parts = lib.name.split(':');
+      if (parts.length >= 3) {
+        const [group, artifact, ver] = parts;
+        const gpath = group.replace(/\./g, '/');
+        const rel = path.join(gpath, artifact, ver, artifact + '-' + ver + '.jar');
+        const lp = path.join(DIR.libraries, rel);
+        if (fs.existsSync(lp)) cp.push(lp);
+      }
+    }
+  }
+  return cp;
+}
+
 async function installFabric(gameVersion) {
-  send('progress', 'Поиск Fabric Loader...');
+  send('progress', 'Поиск Fabric...');
   const loaders = await fetchJson('https://meta.fabricmc.net/v2/versions/loader/' + gameVersion);
   if (!loaders || !loaders.length) throw new Error('Нет Fabric для ' + gameVersion);
   const stable = loaders.find((x) => x.loader && x.loader.stable) || loaders[0];
   const loaderVersion = stable.loader.version;
   const versionId = gameVersion + '-fabric-' + loaderVersion;
 
-  send('progress', 'Установка Fabric ' + loaderVersion);
+  send('progress', 'Профиль Fabric ' + loaderVersion);
   const profile = await fetchJson(
     'https://meta.fabricmc.net/v2/versions/loader/' + gameVersion + '/' + loaderVersion + '/profile/json'
   );
@@ -94,29 +214,8 @@ async function installFabric(gameVersion) {
   fs.mkdirSync(vDir, { recursive: true });
   writeJson(path.join(vDir, versionId + '.json'), profile);
 
-  for (const lib of profile.libraries || []) {
-    let url = null;
-    let rel = null;
-    if (lib.downloads && lib.downloads.artifact) {
-      url = lib.downloads.artifact.url;
-      rel = lib.downloads.artifact.path;
-    } else if (lib.name && lib.url) {
-      const parts = lib.name.split(':');
-      if (parts.length >= 3) {
-        const [group, artifact, ver] = parts;
-        const gpath = group.replace(/\./g, '/');
-        rel = path.join(gpath, artifact, ver, artifact + '-' + ver + '.jar');
-        url = lib.url.replace(/\/$/, '') + '/' + gpath + '/' + artifact + '/' + ver + '/' + artifact + '-' + ver + '.jar';
-      }
-    }
-    if (!url || !rel) continue;
-    const lp = path.join(DIR.libraries, rel);
-    if (fs.existsSync(lp)) continue;
-    fs.mkdirSync(path.dirname(lp), { recursive: true });
-    try { await download(url, lp); } catch (e) { console.warn(e.message); }
-  }
-
-  return { versionId, loaderVersion };
+  await ensureLibraries(profile.libraries);
+  return { versionId, loaderVersion, mainClass: profile.mainClass };
 }
 
 function createWindow() {
@@ -134,8 +233,6 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
-
-  // packaged → dist/index.html ; dev → vite
   if (app.isPackaged) {
     win.loadFile(path.join(__dirname, '../dist/index.html'));
   } else {
@@ -145,9 +242,6 @@ function createWindow() {
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
 
 ipcMain.handle('accounts:list', () => readJson(ACCOUNTS, []));
 ipcMain.handle('accounts:add', (_e, name) => {
@@ -184,35 +278,33 @@ ipcMain.handle('instances:create', async (_e, { name, version, loader }) => {
   if (fs.existsSync(dir)) throw new Error('Инстанс уже существует');
   fs.mkdirSync(path.join(dir, 'mods'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'saves'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'config'), { recursive: true });
 
   let launchVersion = version;
   let loaderVersion = null;
   const selectedLoader = loader || 'vanilla';
 
+  // всегда подтянем vanilla json
+  const manifest = readJson(path.join(DIR.versions, 'manifest.json'), null);
+  if (manifest) {
+    const info = manifest.versions.find((v) => v.id === version);
+    if (info) {
+      const vDir = path.join(DIR.versions, version);
+      fs.mkdirSync(vDir, { recursive: true });
+      const vJsonPath = path.join(vDir, version + '.json');
+      if (!fs.existsSync(vJsonPath)) await download(info.url, vJsonPath);
+    }
+  }
+
   if (selectedLoader === 'fabric') {
     try {
-      const manifest = readJson(path.join(DIR.versions, 'manifest.json'), null);
-      if (manifest) {
-        const info = manifest.versions.find((v) => v.id === version);
-        if (info) {
-          const vDir = path.join(DIR.versions, version);
-          fs.mkdirSync(vDir, { recursive: true });
-          const vJsonPath = path.join(vDir, version + '.json');
-          if (!fs.existsSync(vJsonPath)) await download(info.url, vJsonPath);
-          const vJson = readJson(vJsonPath, null);
-          const jar = path.join(vDir, version + '.jar');
-          if (vJson && vJson.downloads && vJson.downloads.client && !fs.existsSync(jar)) {
-            send('progress', 'Скачивание Minecraft...');
-            await download(vJson.downloads.client.url, jar);
-          }
-        }
-      }
       const fab = await installFabric(version);
       launchVersion = fab.versionId;
       loaderVersion = fab.loaderVersion;
     } catch (e) {
       console.error(e);
-      send('progress', 'Fabric: ' + e.message);
+      send('progress', 'Ошибка Fabric: ' + e.message);
+      throw e;
     }
   }
 
@@ -259,8 +351,9 @@ ipcMain.handle('versions:download', async (_e, versionId) => {
     await download(info.url, existing);
     vJson = readJson(existing, null);
   }
-  if (!vJson) throw new Error('Не удалось загрузить профиль версии');
+  if (!vJson) throw new Error('Нет профиля версии');
 
+  let baseJson = null;
   if (vJson.inheritsFrom) {
     const baseId = vJson.inheritsFrom;
     const baseDir = path.join(DIR.versions, baseId);
@@ -272,63 +365,33 @@ ipcMain.handle('versions:download', async (_e, versionId) => {
         await download(info.url, baseJsonPath);
       }
     }
-    const baseJson = readJson(baseJsonPath, null);
+    baseJson = readJson(baseJsonPath, null);
     if (baseJson) {
       const jar = path.join(baseDir, baseId + '.jar');
       if (!fs.existsSync(jar) && baseJson.downloads && baseJson.downloads.client) {
-        send('progress', 'Скачивание клиента...');
+        send('progress', 'Клиент Minecraft...');
         await download(baseJson.downloads.client.url, jar);
       }
-      for (const lib of baseJson.libraries || []) {
-        const art = lib.downloads && lib.downloads.artifact;
-        if (!art) continue;
-        const lp = path.join(DIR.libraries, art.path);
-        if (fs.existsSync(lp)) continue;
-        fs.mkdirSync(path.dirname(lp), { recursive: true });
-        try { await download(art.url, lp); } catch {}
-      }
+      await ensureLibraries(baseJson.libraries);
     }
-  } else {
-    const vDir = path.join(DIR.versions, versionId);
-    const jar = path.join(vDir, versionId + '.jar');
-    if (!fs.existsSync(jar) && vJson.downloads && vJson.downloads.client) {
-      send('progress', 'Скачивание клиента...');
+  } else if (vJson.downloads && vJson.downloads.client) {
+    const jar = path.join(DIR.versions, versionId, versionId + '.jar');
+    if (!fs.existsSync(jar)) {
+      send('progress', 'Клиент Minecraft...');
       await download(vJson.downloads.client.url, jar);
     }
   }
 
-  send('progress', 'Библиотеки...');
-  for (const lib of vJson.libraries || []) {
-    if (lib.downloads && lib.downloads.artifact) {
-      const art = lib.downloads.artifact;
-      const lp = path.join(DIR.libraries, art.path);
-      if (fs.existsSync(lp)) continue;
-      fs.mkdirSync(path.dirname(lp), { recursive: true });
-      try { await download(art.url, lp); } catch {}
-    } else if (lib.name && lib.url) {
-      const parts = lib.name.split(':');
-      if (parts.length >= 3) {
-        const [group, artifact, ver] = parts;
-        const gpath = group.replace(/\./g, '/');
-        const rel = path.join(gpath, artifact, ver, artifact + '-' + ver + '.jar');
-        const lp = path.join(DIR.libraries, rel);
-        if (fs.existsSync(lp)) continue;
-        const url = lib.url.replace(/\/$/, '') + '/' + gpath + '/' + artifact + '/' + ver + '/' + artifact + '-' + ver + '.jar';
-        fs.mkdirSync(path.dirname(lp), { recursive: true });
-        try { await download(url, lp); } catch {}
-      }
-    }
+  await ensureLibraries(vJson.libraries);
+
+  // Полные assets — настройки, язык, звуки, текстуры UI
+  const assetIndex = vJson.assetIndex || (baseJson && baseJson.assetIndex);
+  if (assetIndex) {
+    send('progress', 'Загрузка ресурсов игры (это может занять время)...');
+    await downloadAssets(assetIndex);
   }
 
   fs.mkdirSync(path.join(DIR.versions, versionId, 'natives'), { recursive: true });
-
-  if (vJson.assetIndex && vJson.assetIndex.url) {
-    const idxDir = path.join(DIR.assets, 'indexes');
-    fs.mkdirSync(idxDir, { recursive: true });
-    const idxPath = path.join(idxDir, vJson.assetIndex.id + '.json');
-    if (!fs.existsSync(idxPath)) await download(vJson.assetIndex.url, idxPath);
-  }
-
   send('progress', 'Готово');
 });
 
@@ -339,10 +402,13 @@ ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
   const acc = readJson(ACCOUNTS, []).find((a) => a.id === accountId);
   if (!acc) throw new Error('Аккаунт не найден');
 
+  // mods лежат в gameDir/mods — Fabric подхватывает автоматически
+  fs.mkdirSync(path.join(instDir, 'mods'), { recursive: true });
+
   const versionId = meta.version;
   const vDir = path.join(DIR.versions, versionId);
   const vJson = readJson(path.join(vDir, versionId + '.json'), null);
-  if (!vJson) throw new Error('Профиль версии не найден');
+  if (!vJson) throw new Error('Профиль версии не найден — пересоздайте инстанс');
 
   let libraries = [...(vJson.libraries || [])];
   let mainClass = vJson.mainClass || 'net.minecraft.client.main.Main';
@@ -359,32 +425,23 @@ ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
     }
   }
 
-  if (!fs.existsSync(jarPath)) throw new Error('Клиент не скачан');
-
-  const cp = [jarPath];
-  for (const lib of libraries) {
-    if (lib.downloads && lib.downloads.artifact) {
-      const lp = path.join(DIR.libraries, lib.downloads.artifact.path);
-      if (fs.existsSync(lp)) cp.push(lp);
-    } else if (lib.name) {
-      const parts = lib.name.split(':');
-      if (parts.length >= 3) {
-        const [group, artifact, ver] = parts;
-        const gpath = group.replace(/\./g, '/');
-        const rel = path.join(gpath, artifact, ver, artifact + '-' + ver + '.jar');
-        const lp = path.join(DIR.libraries, rel);
-        if (fs.existsSync(lp)) cp.push(lp);
-      }
-    }
+  // Для Fabric mainClass должен быть KnotClient
+  if (meta.loader === 'fabric' || (vJson.mainClass && String(vJson.mainClass).includes('fabric'))) {
+    mainClass = vJson.mainClass || 'net.fabricmc.loader.impl.launch.knot.KnotClient';
   }
 
+  if (!fs.existsSync(jarPath)) throw new Error('Клиент не скачан');
+
+  const cp = collectClasspath(libraries, jarPath);
   const nativesDir = path.join(vDir, 'natives');
   fs.mkdirSync(nativesDir, { recursive: true });
   const sep = process.platform === 'win32' ? ';' : ':';
 
   const args = [
-    '-Xmx2G', '-Xms512M',
+    '-Xmx3G',
+    '-Xms1G',
     '-Djava.library.path=' + nativesDir,
+    '-Dfabric.addMods=' + path.join(instDir, 'mods'), // на всякий случай
     '-cp', cp.join(sep),
     mainClass,
     '--username', acc.username,
@@ -398,8 +455,15 @@ ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
     '--versionType', 'release',
   ];
 
-  send('progress', 'Запуск...');
-  const proc = spawn('java', args, { cwd: instDir, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  send('progress', 'Запуск ' + mainClass + '...');
+  const proc = spawn('java', args, {
+    cwd: instDir,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+    },
+  });
   proc.stdout.on('data', (d) => send('log', d.toString()));
   proc.stderr.on('data', (d) => send('log', d.toString()));
   proc.unref();
@@ -421,25 +485,44 @@ ipcMain.handle('mods:remove', (_e, { instanceName, file }) => {
   if (fs.existsSync(p)) fs.unlinkSync(p);
 });
 ipcMain.handle('mods:install', async (_e, { instanceName, slug }) => {
+  const instMeta = readJson(path.join(DIR.instances, instanceName, 'instance.json'), null);
   const modsDir = path.join(DIR.instances, instanceName, 'mods');
   fs.mkdirSync(modsDir, { recursive: true });
-  send('progress', 'Установка мода ' + slug);
+  send('progress', 'Установка ' + slug);
+
   const project = await fetchJson('https://api.modrinth.com/v2/project/' + slug);
-  const versions = await fetchJson('https://api.modrinth.com/v2/project/' + project.id + '/version');
-  if (!versions.length) throw new Error('Нет версий мода');
+  let versions = await fetchJson('https://api.modrinth.com/v2/project/' + project.id + '/version');
+
+  // фильтр по версии игры и лоадеру если есть
+  const gv = instMeta && (instMeta.gameVersion || instMeta.version);
+  const loader = (instMeta && instMeta.loader) || 'fabric';
+  if (gv) {
+    const filtered = versions.filter((v) =>
+      (v.game_versions || []).includes(gv) &&
+      (loader === 'vanilla' || (v.loaders || []).includes(loader))
+    );
+    if (filtered.length) versions = filtered;
+  }
+  if (!versions.length) throw new Error('Нет подходящей версии мода для этой Minecraft');
+
   const ver = versions[0];
   const file = ver.files.find((f) => f.primary) || ver.files[0];
   if (!file) throw new Error('Нет файла');
   const dest = path.join(modsDir, file.filename);
   if (!fs.existsSync(dest)) await download(file.url, dest);
   const installed = [{ title: project.title, filename: file.filename }];
+
   for (const dep of ver.dependencies || []) {
     if (dep.dependency_type !== 'required' || !dep.project_id) continue;
     try {
       const dp = await fetchJson('https://api.modrinth.com/v2/project/' + dep.project_id);
-      const dvs = await fetchJson('https://api.modrinth.com/v2/project/' + dep.project_id + '/version');
+      let dvs = await fetchJson('https://api.modrinth.com/v2/project/' + dep.project_id + '/version');
+      if (gv) {
+        const f = dvs.filter((v) => (v.game_versions || []).includes(gv));
+        if (f.length) dvs = f;
+      }
       if (!dvs.length) continue;
-      const df = dvs[0].files.find((f) => f.primary) || dvs[0].files[0];
+      const df = dvs[0].files.find((x) => x.primary) || dvs[0].files[0];
       if (!df) continue;
       const ddest = path.join(modsDir, df.filename);
       if (!fs.existsSync(ddest)) await download(df.url, ddest);
