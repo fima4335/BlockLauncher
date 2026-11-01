@@ -1,52 +1,31 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('blockLauncher', {
+contextBridge.exposeInMainWorld('api', {
   listAccounts: () => ipcRenderer.invoke('accounts:list'),
-  addOfflineAccount: (username) => ipcRenderer.invoke('accounts:add-offline', username),
+  addAccount: (name) => ipcRenderer.invoke('accounts:add', name),
   removeAccount: (id) => ipcRenderer.invoke('accounts:remove', id),
 
   listInstances: () => ipcRenderer.invoke('instances:list'),
-  createInstance: (options) => ipcRenderer.invoke('instances:create', options),
+  createInstance: (data) => ipcRenderer.invoke('instances:create', data),
   deleteInstance: (name) => ipcRenderer.invoke('instances:delete', name),
-  getMods: (name) => ipcRenderer.invoke('instances:get-mods', name),
 
-  getVersionManifest: () => ipcRenderer.invoke('versions:manifest'),
-  downloadVersion: (versionId) => ipcRenderer.invoke('versions:download', versionId),
+  getVersions: () => ipcRenderer.invoke('versions:list'),
+  downloadVersion: (id) => ipcRenderer.invoke('versions:download', id),
+  launch: (instanceName, accountId) => ipcRenderer.invoke('launch', { instanceName, accountId }),
 
-  getFabricVersions: (gameVersion) => ipcRenderer.invoke('loaders:fabric-versions', gameVersion),
-  getForgeVersions: (gameVersion) => ipcRenderer.invoke('loaders:forge-versions', gameVersion),
-  getNeoForgeVersions: (gameVersion) => ipcRenderer.invoke('loaders:neoforge-versions', gameVersion),
-  installLoader: (opts) => ipcRenderer.invoke('loaders:install', opts),
-
-  searchMods: (opts) => ipcRenderer.invoke('mods:search', opts),
-  installMod: (opts) => ipcRenderer.invoke('mods:install', opts),
+  searchMods: (q) => ipcRenderer.invoke('mods:search', q),
+  installMod: (instanceName, slug) => ipcRenderer.invoke('mods:install', { instanceName, slug }),
   listMods: (instanceName) => ipcRenderer.invoke('mods:list', instanceName),
-  removeMod: (opts) => ipcRenderer.invoke('mods:remove', opts),
-  toggleMod: (opts) => ipcRenderer.invoke('mods:toggle', opts),
+  removeMod: (instanceName, file) => ipcRenderer.invoke('mods:remove', { instanceName, file }),
 
-  launch: (data) => ipcRenderer.invoke('launch:start', data),
-
-  getConfig: () => ipcRenderer.invoke('config:get'),
-  setConfig: (config) => ipcRenderer.invoke('config:set', config),
-
-  onDownloadProgress: (cb) => {
-    const handler = (_e, data) => cb(data);
-    ipcRenderer.on('download:progress', handler);
-    return () => ipcRenderer.removeListener('download:progress', handler);
+  onLog: (cb) => {
+    const h = (_e, line) => cb(line);
+    ipcRenderer.on('log', h);
+    return () => ipcRenderer.removeListener('log', h);
   },
-  onLaunchLog: (cb) => {
-    const handler = (_e, data) => cb(data);
-    ipcRenderer.on('launch:log', handler);
-    return () => ipcRenderer.removeListener('launch:log', handler);
-  },
-  onLoaderProgress: (cb) => {
-    const handler = (_e, data) => cb(data);
-    ipcRenderer.on('loader:progress', handler);
-    return () => ipcRenderer.removeListener('loader:progress', handler);
-  },
-  onModsProgress: (cb) => {
-    const handler = (_e, data) => cb(data);
-    ipcRenderer.on('mods:progress', handler);
-    return () => ipcRenderer.removeListener('mods:progress', handler);
+  onProgress: (cb) => {
+    const h = (_e, msg) => cb(msg);
+    ipcRenderer.on('progress', h);
+    return () => ipcRenderer.removeListener('progress', h);
   },
 });

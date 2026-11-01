@@ -1,352 +1,309 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
+const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
-const uuidv4 = () => randomUUID();
 
-// Optional launcher modules (won't crash if missing)
-let fabric = null, forge = null, modrinthInstall = null;
-try { fabric = require('./launcher/fabric'); } catch (e) { console.warn(e.message); }
-try { forge = require('./launcher/forge'); } catch (e) { console.warn(e.message); }
-try { modrinthInstall = require('./launcher/modrinth-install'); } catch (e) { console.warn(e.message); }
+const ROOT = app.getPath('userData');
+const DIR = {
+  instances: path.join(ROOT, 'instances'),
+  versions: path.join(ROOT, 'versions'),
+  libraries: path.join(ROOT, 'libraries'),
+  assets: path.join(ROOT, 'assets'),
+};
+const ACCOUNTS = path.join(ROOT, 'accounts.json');
 
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught:', err);
-  try { dialog.showErrorBox('BlockLauncher Error', String(err && err.stack || err)); } catch {}
-});
+for (const d of Object.values(DIR)) fs.mkdirSync(d, { recursive: true });
 
-const USER_DATA = app.getPath('userData');
-const INSTANCES_DIR = path.join(USER_DATA, 'instances');
-const VERSIONS_DIR = path.join(USER_DATA, 'versions');
-const JAVA_DIR = path.join(USER_DATA, 'java');
-const ACCOUNTS_FILE = path.join(USER_DATA, 'accounts.json');
-const CONFIG_FILE = path.join(USER_DATA, 'config.json');
+let win = null;
+const send = (ch, data) => win && win.webContents.send(ch, data);
 
-[INSTANCES_DIR, VERSIONS_DIR, JAVA_DIR].forEach(dir => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
-
-let mainWindow = null;
-
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 900,
-    minHeight: 600,
-    title: 'BlockLauncher',
-    backgroundColor: '#0f172a',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false
-    }
-  });
-
-  const isDev = !app.isPackaged;
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
-  }
-
-  mainWindow.on('closed', () => { mainWindow = null; });
-}
-
-app.whenReady().then(createWindow);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
-
-function readJson(file, fallback = null) {
+function readJson(file, fallback) {
   try {
     if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {}
   return fallback;
 }
-
 function writeJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-function downloadFile(url, dest, onProgress) {
+function download(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    const proto = url.startsWith('https') ? https : http;
-    const request = proto.get(url, { headers: { 'User-Agent': 'BlockLauncher/0.3.1' } }, (res) => {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.0' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close();
-        fs.unlinkSync(dest);
-        return downloadFile(res.headers.location, dest, onProgress).then(resolve).catch(reject);
+        fs.unlink(dest, () => {});
+        return download(res.headers.location, dest, onProgress).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
         file.close();
-        return reject(new Error('HTTP ' + res.statusCode));
+        return reject(new Error('HTTP ' + res.statusCode + ' ' + url));
       }
       const total = parseInt(res.headers['content-length'] || '0', 10);
-      let downloaded = 0;
-      res.on('data', (chunk) => {
-        downloaded += chunk.length;
-        if (onProgress && total) onProgress(downloaded / total);
+      let done = 0;
+      res.on('data', (c) => {
+        done += c.length;
+        if (onProgress && total) onProgress(done / total);
       });
       res.pipe(file);
       file.on('finish', () => file.close(() => resolve()));
     });
-    request.on('error', (err) => {
+    req.on('error', (e) => {
       fs.unlink(dest, () => {});
-      reject(err);
+      reject(e);
     });
   });
 }
 
-ipcMain.handle('accounts:list', () => readJson(ACCOUNTS_FILE, []));
-
-ipcMain.handle('accounts:add-offline', (event, username) => {
-  const accounts = readJson(ACCOUNTS_FILE, []);
-  const account = {
-    id: uuidv4(),
-    type: 'offline',
-    username: String(username || '').trim(),
-    uuid: uuidv4().replace(/-/g, ''),
-    accessToken: '0',
-    createdAt: new Date().toISOString()
-  };
-  accounts.push(account);
-  writeJson(ACCOUNTS_FILE, accounts);
-  return account;
-});
-
-ipcMain.handle('accounts:remove', (event, id) => {
-  let accounts = readJson(ACCOUNTS_FILE, []);
-  accounts = accounts.filter(a => a.id !== id);
-  writeJson(ACCOUNTS_FILE, accounts);
-  return true;
-});
-
-ipcMain.handle('instances:list', () => {
-  const list = [];
-  if (!fs.existsSync(INSTANCES_DIR)) return list;
-  for (const name of fs.readdirSync(INSTANCES_DIR)) {
-    const instPath = path.join(INSTANCES_DIR, name);
-    const metaPath = path.join(instPath, 'instance.json');
-    if (fs.existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-        list.push({ ...meta, path: instPath });
-      } catch {}
-    }
-  }
-  return list.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
-});
-
-ipcMain.handle('instances:create', async (event, options) => {
-  const { name, version, loader = 'vanilla', loaderVersion = null } = options;
-  const safeName = String(name || '').replace(/[<>:"/\\|?*]/g, '_').trim();
-  const instPath = path.join(INSTANCES_DIR, safeName);
-  if (fs.existsSync(instPath)) throw new Error('Инстанс с таким именем уже существует');
-
-  fs.mkdirSync(instPath, { recursive: true });
-  fs.mkdirSync(path.join(instPath, 'mods'), { recursive: true });
-  fs.mkdirSync(path.join(instPath, 'resourcepacks'), { recursive: true });
-  fs.mkdirSync(path.join(instPath, 'saves'), { recursive: true });
-
-  let resolvedVersion = version;
-  let resolvedLoaderVersion = loaderVersion;
-  const send = (data) => mainWindow?.webContents.send('loader:progress', data);
-
-  if (loader && loader !== 'vanilla') {
-    try {
-      if (loader === 'fabric' && fabric) {
-        const result = await fabric.installFabric(VERSIONS_DIR, version, loaderVersion, send);
-        resolvedVersion = result.versionId;
-        resolvedLoaderVersion = result.loaderVersion;
-      } else if (loader === 'forge' && forge) {
-        const result = await forge.installForge(VERSIONS_DIR, version, loaderVersion, send);
-        resolvedVersion = result.versionId;
-        resolvedLoaderVersion = result.loaderVersion;
-      } else if (loader === 'neoforge' && forge) {
-        const result = await forge.installNeoForge(VERSIONS_DIR, version, loaderVersion, send);
-        resolvedVersion = result.versionId;
-        resolvedLoaderVersion = result.loaderVersion;
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    lib.get(url, { headers: { 'User-Agent': 'BlockLauncher/1.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchJson(res.headers.location).then(resolve).catch(reject);
       }
-    } catch (e) {
-      console.error('Loader install error:', e);
-    }
-  }
-
-  const meta = {
-    id: uuidv4(),
-    name: safeName,
-    version: resolvedVersion,
-    gameVersion: version,
-    loader,
-    loaderVersion: resolvedLoaderVersion,
-    createdAt: new Date().toISOString(),
-    lastPlayed: null,
-    javaArgs: '-Xmx4G -Xms1G',
-    icon: null
-  };
-  writeJson(path.join(instPath, 'instance.json'), meta);
-  return { ...meta, path: instPath };
-});
-
-ipcMain.handle('instances:delete', (event, name) => {
-  const instPath = path.join(INSTANCES_DIR, name);
-  if (fs.existsSync(instPath)) fs.rmSync(instPath, { recursive: true, force: true });
-  return true;
-});
-
-ipcMain.handle('instances:get-mods', (event, name) => {
-  const modsDir = path.join(INSTANCES_DIR, name, 'mods');
-  if (!fs.existsSync(modsDir)) return [];
-  return fs.readdirSync(modsDir).filter(f => f.endsWith('.jar')).map(f => ({ name: f, path: path.join(modsDir, f) }));
-});
-
-ipcMain.handle('versions:manifest', async () => {
-  const cacheFile = path.join(VERSIONS_DIR, 'version_manifest_v2.json');
-  const url = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json';
-  try { await downloadFile(url, cacheFile); } catch (e) {
-    if (!fs.existsSync(cacheFile)) throw e;
-  }
-  return readJson(cacheFile);
-});
-
-ipcMain.handle('versions:download', async (event, versionId) => {
-  const manifest = readJson(path.join(VERSIONS_DIR, 'version_manifest_v2.json'));
-  if (!manifest) throw new Error('Манифест версий не загружен');
-  const versionInfo = manifest.versions.find(v => v.id === versionId);
-  if (!versionInfo) throw new Error('Версия ' + versionId + ' не найдена');
-  const versionDir = path.join(VERSIONS_DIR, versionId);
-  fs.mkdirSync(versionDir, { recursive: true });
-  const versionJsonPath = path.join(versionDir, versionId + '.json');
-  await downloadFile(versionInfo.url, versionJsonPath);
-  const versionJson = readJson(versionJsonPath);
-  const clientJar = path.join(versionDir, versionId + '.jar');
-  if (!fs.existsSync(clientJar)) {
-    await downloadFile(versionJson.downloads.client.url, clientJar, (p) => {
-      mainWindow?.webContents.send('download:progress', { type: 'client', progress: p, version: versionId });
-    });
-  }
-  const librariesDir = path.join(VERSIONS_DIR, 'libraries');
-  fs.mkdirSync(librariesDir, { recursive: true });
-  for (const lib of versionJson.libraries || []) {
-    if (!lib.downloads?.artifact) continue;
-    const artifact = lib.downloads.artifact;
-    const libPath = path.join(librariesDir, artifact.path);
-    if (!fs.existsSync(libPath)) {
-      fs.mkdirSync(path.dirname(libPath), { recursive: true });
-      try { await downloadFile(artifact.url, libPath); } catch (e) { console.warn(e.message); }
-    }
-  }
-  return { versionId, path: versionDir };
-});
-
-ipcMain.handle('launch:start', async (event, { instanceName, accountId }) => {
-  const instPath = path.join(INSTANCES_DIR, instanceName);
-  const metaPath = path.join(instPath, 'instance.json');
-  if (!fs.existsSync(metaPath)) throw new Error('Инстанс не найден');
-  const meta = readJson(metaPath);
-  const accounts = readJson(ACCOUNTS_FILE, []);
-  const account = accounts.find(a => a.id === accountId);
-  if (!account) throw new Error('Аккаунт не найден');
-  const versionId = meta.version;
-  const versionDir = path.join(VERSIONS_DIR, versionId);
-  const versionJsonPath = path.join(versionDir, versionId + '.json');
-  const clientJar = path.join(versionDir, versionId + '.jar');
-  if (!fs.existsSync(versionJsonPath) || !fs.existsSync(clientJar)) {
-    throw new Error('Версия ' + versionId + ' не скачана. Сначала скачайте её.');
-  }
-  const versionJson = readJson(versionJsonPath);
-  const librariesDir = path.join(VERSIONS_DIR, 'libraries');
-  const classpath = [clientJar];
-  for (const lib of versionJson.libraries || []) {
-    if (lib.downloads?.artifact) {
-      const libPath = path.join(librariesDir, lib.downloads.artifact.path);
-      if (fs.existsSync(libPath)) classpath.push(libPath);
-    }
-  }
-  const nativesDir = path.join(versionDir, 'natives');
-  fs.mkdirSync(nativesDir, { recursive: true });
-  const assetsDir = path.join(VERSIONS_DIR, 'assets');
-  const args = [
-    ...(meta.javaArgs || '-Xmx4G -Xms1G').split(/\s+/).filter(Boolean),
-    '-Djava.library.path=' + nativesDir,
-    '-cp', classpath.join(process.platform === 'win32' ? ';' : ':'),
-    versionJson.mainClass || 'net.minecraft.client.main.Main',
-    '--username', account.username,
-    '--version', versionId,
-    '--gameDir', instPath,
-    '--assetsDir', assetsDir,
-    '--assetIndex', (versionJson.assetIndex && versionJson.assetIndex.id) || versionId,
-    '--uuid', account.uuid,
-    '--accessToken', account.accessToken || '0',
-    '--userType', account.type === 'offline' ? 'legacy' : 'msa',
-    '--versionType', 'release'
-  ];
-  meta.lastPlayed = Date.now();
-  writeJson(metaPath, meta);
-  const proc = spawn('java', args, { cwd: instPath, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  proc.stdout.on('data', (data) => mainWindow?.webContents.send('launch:log', data.toString()));
-  proc.stderr.on('data', (data) => mainWindow?.webContents.send('launch:log', data.toString()));
-  proc.unref();
-  return { pid: proc.pid, instance: instanceName };
-});
-
-ipcMain.handle('loaders:fabric-versions', async (e, gv) => {
-  if (!fabric) throw new Error('Fabric module not loaded');
-  return fabric.getLoaderVersions(gv);
-});
-ipcMain.handle('loaders:forge-versions', async (e, gv) => {
-  if (!forge) throw new Error('Forge module not loaded');
-  return forge.getForgeVersions(gv);
-});
-ipcMain.handle('loaders:neoforge-versions', async (e, gv) => {
-  if (!forge) throw new Error('Forge module not loaded');
-  return forge.getNeoForgeVersions(gv);
-});
-ipcMain.handle('loaders:install', async (e, opts) => {
-  throw new Error('Use instance create with loader selected');
-});
-
-ipcMain.handle('mods:search', async (e, { query, loaders, gameVersions, limit }) => {
-  if (!modrinthInstall) throw new Error('Modrinth module not loaded');
-  return modrinthInstall.searchMods(query, { loaders, gameVersions, limit });
-});
-ipcMain.handle('mods:install', async (e, { instanceName, slug, loaders, gameVersions }) => {
-  if (!modrinthInstall) throw new Error('Modrinth module not loaded');
-  const modsDir = path.join(INSTANCES_DIR, instanceName, 'mods');
-  const send = (data) => mainWindow?.webContents.send('mods:progress', data);
-  return modrinthInstall.installModToInstance(modsDir, slug, {
-    loaders: loaders || ['fabric', 'forge', 'neoforge', 'quilt'],
-    gameVersions: gameVersions || [],
-    onProgress: send
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
   });
+}
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1100,
+    height: 720,
+    backgroundColor: '#0f172a',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  if (!app.isPackaged) {
+    win.loadURL('http://localhost:5173');
+  } else {
+    win.loadFile(path.join(__dirname, '../dist/index.html'));
+  }
+}
+
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+
+// Accounts
+ipcMain.handle('accounts:list', () => readJson(ACCOUNTS, []));
+ipcMain.handle('accounts:add', (_e, name) => {
+  const list = readJson(ACCOUNTS, []);
+  const acc = {
+    id: randomUUID(),
+    username: String(name || 'Player').trim(),
+    uuid: randomUUID().replace(/-/g, ''),
+    type: 'offline',
+  };
+  list.push(acc);
+  writeJson(ACCOUNTS, list);
+  return acc;
 });
-ipcMain.handle('mods:list', (e, instanceName) => {
-  if (!modrinthInstall) return [];
-  return modrinthInstall.listInstalledMods(path.join(INSTANCES_DIR, instanceName, 'mods'));
-});
-ipcMain.handle('mods:remove', (e, { instanceName, filename }) => {
-  if (!modrinthInstall) throw new Error('Modrinth module not loaded');
-  return modrinthInstall.removeMod(path.join(INSTANCES_DIR, instanceName, 'mods'), filename);
-});
-ipcMain.handle('mods:toggle', (e, { instanceName, filename }) => {
-  if (!modrinthInstall) throw new Error('Modrinth module not loaded');
-  return modrinthInstall.toggleMod(path.join(INSTANCES_DIR, instanceName, 'mods'), filename);
+ipcMain.handle('accounts:remove', (_e, id) => {
+  writeJson(ACCOUNTS, readJson(ACCOUNTS, []).filter((a) => a.id !== id));
 });
 
-ipcMain.handle('config:get', () => readJson(CONFIG_FILE, { language: 'ru', theme: 'dark', maxMemory: 4096 }));
-ipcMain.handle('config:set', (e, config) => { writeJson(CONFIG_FILE, config); return true; });
+// Instances
+ipcMain.handle('instances:list', () => {
+  const out = [];
+  for (const name of fs.readdirSync(DIR.instances)) {
+    const meta = path.join(DIR.instances, name, 'instance.json');
+    if (fs.existsSync(meta)) {
+      try { out.push(JSON.parse(fs.readFileSync(meta, 'utf8'))); } catch {}
+    }
+  }
+  return out;
+});
+ipcMain.handle('instances:create', (_e, { name, version }) => {
+  const safe = String(name).replace(/[<>:"/\\|?*]/g, '_').trim();
+  const dir = path.join(DIR.instances, safe);
+  if (fs.existsSync(dir)) throw new Error('Уже существует');
+  fs.mkdirSync(path.join(dir, 'mods'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'saves'), { recursive: true });
+  const meta = { id: randomUUID(), name: safe, version, createdAt: Date.now() };
+  writeJson(path.join(dir, 'instance.json'), meta);
+  return meta;
+});
+ipcMain.handle('instances:delete', (_e, name) => {
+  const dir = path.join(DIR.instances, name);
+  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
-console.log('BlockLauncher started');
-console.log('User data:', USER_DATA);
+// Versions
+ipcMain.handle('versions:list', async () => {
+  const cache = path.join(DIR.versions, 'manifest.json');
+  try {
+    await download('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json', cache);
+  } catch (e) {
+    if (!fs.existsSync(cache)) throw e;
+  }
+  return readJson(cache, { versions: [] });
+});
+
+ipcMain.handle('versions:download', async (_e, versionId) => {
+  send('progress', 'Манифест ' + versionId);
+  const manifest = readJson(path.join(DIR.versions, 'manifest.json'), null);
+  if (!manifest) throw new Error('Сначала открой список версий');
+  const info = manifest.versions.find((v) => v.id === versionId);
+  if (!info) throw new Error('Версия не найдена');
+
+  const vDir = path.join(DIR.versions, versionId);
+  fs.mkdirSync(vDir, { recursive: true });
+  const vJsonPath = path.join(vDir, versionId + '.json');
+  await download(info.url, vJsonPath);
+  const vJson = readJson(vJsonPath, null);
+  if (!vJson) throw new Error('Не удалось прочитать version json');
+
+  const jar = path.join(vDir, versionId + '.jar');
+  if (!fs.existsSync(jar)) {
+    send('progress', 'Скачивание клиента ' + versionId);
+    await download(vJson.downloads.client.url, jar, (p) => send('progress', 'Клиент ' + Math.round(p * 100) + '%'));
+  }
+
+  send('progress', 'Библиотеки...');
+  for (const lib of vJson.libraries || []) {
+    const art = lib.downloads && lib.downloads.artifact;
+    if (!art) continue;
+    const lp = path.join(DIR.libraries, art.path);
+    if (fs.existsSync(lp)) continue;
+    fs.mkdirSync(path.dirname(lp), { recursive: true });
+    try { await download(art.url, lp); } catch (e) { console.warn(e.message); }
+  }
+
+  // natives (simplified: download classifiers if present)
+  const nativesDir = path.join(vDir, 'natives');
+  fs.mkdirSync(nativesDir, { recursive: true });
+
+  // asset index
+  if (vJson.assetIndex && vJson.assetIndex.url) {
+    const idxDir = path.join(DIR.assets, 'indexes');
+    fs.mkdirSync(idxDir, { recursive: true });
+    const idxPath = path.join(idxDir, vJson.assetIndex.id + '.json');
+    if (!fs.existsSync(idxPath)) {
+      send('progress', 'Asset index...');
+      await download(vJson.assetIndex.url, idxPath);
+    }
+  }
+
+  send('progress', 'Версия готова');
+});
+
+// Launch
+ipcMain.handle('launch', async (_e, { instanceName, accountId }) => {
+  const instDir = path.join(DIR.instances, instanceName);
+  const meta = readJson(path.join(instDir, 'instance.json'), null);
+  if (!meta) throw new Error('Инстанс не найден');
+  const acc = readJson(ACCOUNTS, []).find((a) => a.id === accountId);
+  if (!acc) throw new Error('Аккаунт не найден');
+
+  const versionId = meta.version;
+  const vDir = path.join(DIR.versions, versionId);
+  const vJson = readJson(path.join(vDir, versionId + '.json'), null);
+  const jar = path.join(vDir, versionId + '.jar');
+  if (!vJson || !fs.existsSync(jar)) throw new Error('Версия не скачана');
+
+  const cp = [jar];
+  for (const lib of vJson.libraries || []) {
+    const art = lib.downloads && lib.downloads.artifact;
+    if (!art) continue;
+    const lp = path.join(DIR.libraries, art.path);
+    if (fs.existsSync(lp)) cp.push(lp);
+  }
+
+  const nativesDir = path.join(vDir, 'natives');
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const args = [
+    '-Xmx2G',
+    '-Xms512M',
+    '-Djava.library.path=' + nativesDir,
+    '-cp', cp.join(sep),
+    vJson.mainClass || 'net.minecraft.client.main.Main',
+    '--username', acc.username,
+    '--version', versionId,
+    '--gameDir', instDir,
+    '--assetsDir', DIR.assets,
+    '--assetIndex', (vJson.assetIndex && vJson.assetIndex.id) || versionId,
+    '--uuid', acc.uuid,
+    '--accessToken', '0',
+    '--userType', 'legacy',
+    '--versionType', 'release',
+  ];
+
+  send('progress', 'Старт Java...');
+  const proc = spawn('java', args, {
+    cwd: instDir,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', (d) => send('log', d.toString()));
+  proc.stderr.on('data', (d) => send('log', d.toString()));
+  proc.unref();
+  return { pid: proc.pid };
+});
+
+// Mods (Modrinth)
+ipcMain.handle('mods:search', async (_e, q) => {
+  const url = 'https://api.modrinth.com/v2/search?query=' + encodeURIComponent(q || '') +
+    '&limit=20&facets=' + encodeURIComponent('[["project_type:mod"]]');
+  return fetchJson(url);
+});
+
+ipcMain.handle('mods:list', (_e, instanceName) => {
+  const modsDir = path.join(DIR.instances, instanceName, 'mods');
+  if (!fs.existsSync(modsDir)) return [];
+  return fs.readdirSync(modsDir).filter((f) => f.endsWith('.jar')).map((f) => ({ filename: f }));
+});
+
+ipcMain.handle('mods:remove', (_e, { instanceName, file }) => {
+  const p = path.join(DIR.instances, instanceName, 'mods', file);
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+});
+
+ipcMain.handle('mods:install', async (_e, { instanceName, slug }) => {
+  const modsDir = path.join(DIR.instances, instanceName, 'mods');
+  fs.mkdirSync(modsDir, { recursive: true });
+  send('progress', 'Modrinth: ' + slug);
+  const project = await fetchJson('https://api.modrinth.com/v2/project/' + slug);
+  const versions = await fetchJson('https://api.modrinth.com/v2/project/' + project.id + '/version');
+  if (!versions.length) throw new Error('Нет версий мода');
+  const ver = versions[0];
+  const file = ver.files.find((f) => f.primary) || ver.files[0];
+  if (!file) throw new Error('Нет файла');
+  const dest = path.join(modsDir, file.filename);
+  if (!fs.existsSync(dest)) await download(file.url, dest);
+
+  const installed = [{ title: project.title, filename: file.filename }];
+
+  // required deps
+  for (const dep of ver.dependencies || []) {
+    if (dep.dependency_type !== 'required' || !dep.project_id) continue;
+    try {
+      const dp = await fetchJson('https://api.modrinth.com/v2/project/' + dep.project_id);
+      const dvs = await fetchJson('https://api.modrinth.com/v2/project/' + dep.project_id + '/version');
+      if (!dvs.length) continue;
+      const df = (dvs[0].files.find((f) => f.primary) || dvs[0].files[0]);
+      if (!df) continue;
+      const ddest = path.join(modsDir, df.filename);
+      if (!fs.existsSync(ddest)) await download(df.url, ddest);
+      installed.push({ title: dp.title, filename: df.filename });
+    } catch (e) {
+      console.warn(e.message);
+    }
+  }
+  send('progress', 'Моды установлены');
+  return installed;
+});
+
+console.log('BlockLauncher data:', ROOT);
